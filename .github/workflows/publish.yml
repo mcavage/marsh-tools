@@ -1,0 +1,83 @@
+name: Publish
+# Follows gog's releases: every six hours, build the latest gog release into the
+# gog Kit, build the bamboohr Kit, run the offline smoke test, then push
+# :VERSION (gog only) and move :stable. A failed build or smoke test never
+# moves :stable. A change here (push to main) or a manual run republishes.
+on:
+  schedule:
+    - cron: '41 */6 * * *'
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: publish
+  cancel-in-progress: false
+env:
+  GOG_IMAGE: docker.io/mcavage/marsh-gog
+  BAMBOOHR_IMAGE: docker.io/mcavage/marsh-bamboohr
+jobs:
+  publish:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Latest gog release
+        id: gog
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag=$(gh api repos/steipete/gogcli/releases/latest -q .tag_name)
+          version=${tag#v}
+          case "$version" in *[!0-9.]*|'') echo "unexpected gog tag $tag" >&2; exit 1;; esac
+          gh release download "$tag" -R steipete/gogcli -p checksums.txt -O checksums.txt
+          sha=$(awk -v f="gogcli_${version}_linux_arm64.tar.gz" '$2==f {print $1}' checksums.txt)
+          case "$sha" in *[!0-9a-f]*|'') echo "no linux arm64 checksum for $tag" >&2; exit 1;; esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "gog $version ($sha)"
+      - name: Already published?
+        id: check
+        env:
+          VERSION: ${{ steps.gog.outputs.version }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = schedule ] && docker buildx imagetools inspect "$GOG_IMAGE:$VERSION" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"; echo "gog $VERSION is already published"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        if: steps.check.outputs.skip == 'false'
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        if: steps.check.outputs.skip == 'false'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build and smoke-test
+        if: steps.check.outputs.skip == 'false'
+        env:
+          VERSION: ${{ steps.gog.outputs.version }}
+          SHA: ${{ steps.gog.outputs.sha }}
+        run: |
+          set -eu
+          sed -i "s/\"gogcli@[^\"]*\"/\"gogcli@$VERSION\"/" kits/gog/kit.yaml
+          docker buildx build --platform linux/arm64 --load -f kits/gog/kit.yaml \
+            --build-arg "GOG_VERSION=$VERSION" --build-arg "GOG_SHA256=$SHA" -t marsh-gog:candidate kits/gog
+          docker buildx build --platform linux/arm64 --load -f kits/bamboohr/kit.yaml -t marsh-bamboohr:candidate kits/bamboohr
+          tests/smoke.sh marsh-gog:candidate marsh-bamboohr:candidate
+      - name: Publish
+        if: steps.check.outputs.skip == 'false'
+        env:
+          VERSION: ${{ steps.gog.outputs.version }}
+          SHA: ${{ steps.gog.outputs.sha }}
+        run: |
+          set -eu
+          docker buildx build --platform linux/arm64 --push -f kits/gog/kit.yaml \
+            --build-arg "GOG_VERSION=$VERSION" --build-arg "GOG_SHA256=$SHA" \
+            -t "$GOG_IMAGE:$VERSION" -t "$GOG_IMAGE:stable" kits/gog
+          docker buildx build --platform linux/arm64 --push -f kits/bamboohr/kit.yaml \
+            -t "$BAMBOOHR_IMAGE:stable" kits/bamboohr
