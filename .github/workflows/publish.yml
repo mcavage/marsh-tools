@@ -25,6 +25,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Latest gog release
         id: gog
         env:
@@ -65,12 +66,17 @@ jobs:
         run: |
           set -eu
           sed -i "s/\"gogcli@[^\"]*\"/\"gogcli@$VERSION\"/" kits/gog/kit.yaml
+          # bamboohr's version changes only with its own code, so a rebuild alone
+          # doesn't announce an update.
+          bamboo=$(git log -1 --date=format:%Y.%m.%d --format=%cd-%h -- kits/bamboohr)
+          sed -i "s/\"bamboohr@[^\"]*\"/\"bamboohr@$bamboo\"/" kits/bamboohr/kit.yaml
           docker buildx build --platform linux/arm64 --load -f kits/gog/kit.yaml \
             --build-arg "GOG_VERSION=$VERSION" --build-arg "GOG_SHA256=$SHA" -t marsh-gog:candidate kits/gog
           docker buildx build --platform linux/arm64 --load -f kits/bamboohr/kit.yaml -t marsh-bamboohr:candidate kits/bamboohr
           tests/smoke.sh marsh-gog:candidate marsh-bamboohr:candidate
       - name: Publish
         if: steps.check.outputs.skip == 'false'
+        # Builds from the version-stamped descriptors of the previous step.
         env:
           VERSION: ${{ steps.gog.outputs.version }}
           SHA: ${{ steps.gog.outputs.sha }}
